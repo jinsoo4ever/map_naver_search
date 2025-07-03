@@ -1,0 +1,9 @@
+.idea/
+.venv/
+build/
+dist/
+main.spec
+key.ini
+list.txt
+result*.xlsx
+zap_scraped_html/
