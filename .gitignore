@@ -7,3 +7,5 @@ key.ini
 list.txt
 result*.xlsx
 zap_scraped_html/
+# Python cache
+**/__pycache__/
