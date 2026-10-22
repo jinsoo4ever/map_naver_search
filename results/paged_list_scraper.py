@@ -1,35 +1,77 @@
 import gc
-import psutil
 import re
 
 from bs4 import BeautifulSoup
 
 from selenium.common import NoSuchElementException
 from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.webdriver import WebDriver  # 타입 힌트용
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
-from common_logic.utils import CommonUtils
+from common_logic.utils import (
+    CommonUtils, is_session_dead_error, is_frame_lost_error, is_renderer_dead_error,
+)
 from search_logic.keyword import SearchKeyword
 from file_logic.excel import append_info_row_to_excel
 
 
+class BrowserSessionDead(Exception):
+    """브라우저/드라이버 세션이 완전히 끊겨 더 이상 진행할 수 없을 때"""
+
+
+class BrowserTabDead(Exception):
+    """탭(렌더러)이 죽어 응답하지 않을 때. 새 탭으로 갈아타면 계속할 수 있다 (예: Out of Memory)"""
+
+
+# 상세 정보 추출에 실패했을 때 엑셀에 빈 행이라도 남기기 위한 기본값
+EMPTY_INFO = {'address': None, 'lot_number': None, 'phone': None, 'homepage': None, 'share': None, 'intro': None, 'main_keyword': []}
+
+
 class ResultsPagedListScraper:
+    # 같은 항목에서 프레임 재진입을 몇 번까지 시도할지
+    MAX_FRAME_RECOVER_TRIES = 3
+    # 같은 페이지에서 탭 교체(새 탭 재검색)를 몇 번까지 시도할지
+    MAX_TAB_RECOVER_TRIES = 3
+
+    # 리스트 항목(li) 안의 가게명 링크.
+    # 예전 DOM 은 a.place_bluelink 였지만 지금은 난독화 클래스(XCvzh, YTJkH ...)라 클래스에 기대지 않고,
+    # 썸네일 링크(a.place_thumb)를 제외한 첫 번째 role="button" 링크를 가게명 링크로 본다.
+    TITLE_LINK_XPATH = ('.//a[contains(@class, "place_bluelink")]'
+                        ' | .//a[@role="button" and not(contains(@class, "place_thumb"))]')
+
+    # 상세 화면 제목 영역에 가게명보다 먼저 나올 수 있는 배지 문구. 이 값이 잡히면 가게명이 아니다.
+    NAME_BADGE_TEXTS = ("플레이스 플러스", "플레이스플러스")
+
     def __init__(self, driver, config, log=None, excel_output_path=None):
         self.driver = driver
         self.config = config
         self.log = log or print
-        self.recover_test_done = False  # 복구 테스트 1회용 플래그
 
         self.sleep_short_sec = int(config.get("sleep_short_sec", 1))
         self.sleep_normal_sec = int(config.get("sleep_normal_sec", 3))
         self.sleep_long_sec = int(config.get("sleep_long_sec", 5))
         self.web_driver_wait_sec = int(config.get("web_driver_wait_sec", 10))
-        self.wait = WebDriverWait(driver, 10)
+        self.wait = WebDriverWait(driver, self.web_driver_wait_sec)
 
         self.utils = CommonUtils(self.config, self.log)
         self.excel_output_path = excel_output_path
+        # 한 탭에서 항목을 몇 개 처리할 때마다 새 탭으로 갈아탈지 (key.ini 의 tab_reset_every_items 로 조정 가능).
+        # 실측: 항목 50개 처리에 JS 힙 1.7GB, 문서 148개까지 쌓임 → 20개마다 비우면 넉넉하다.
+        self.tab_reset_every_items = int(config.get("tab_reset_every_items", 20))
+
+    def find_title_link(self, li):
+        """li 안의 가게명 링크 요소. 없으면 None (광고/구분용 li 등)"""
+        links = li.find_elements(By.XPATH, self.TITLE_LINK_XPATH)
+        return links[0] if links else None
+
+    def get_item_title(self, li) -> str:
+        link = self.find_title_link(li)
+        if link is None:
+            return ""
+        spans = link.find_elements(By.XPATH, './span[1]')
+        text = (spans[0].text if spans else link.text).strip()
+        # 가게명 span 안에 배지/부가 문구가 줄바꿈으로 더 붙는 경우가 있어 첫 줄만 가게명으로 쓴다
+        return text.splitlines()[0].strip() if text else ""
 
     def switch_to_frame(self, frame_id: str) -> bool:
         try:
@@ -43,274 +85,333 @@ class ResultsPagedListScraper:
             return True
         except Exception as e:
             self.log(f"[ERROR] iframe({frame_id}) 진입 실패: {e}")
+            if is_session_dead_error(e):
+                raise BrowserSessionDead(str(e)) from e
+            if is_renderer_dead_error(e):
+                raise BrowserTabDead(str(e).splitlines()[0]) from e
             return False
 
-    def kill_driver_children(self, parent_pid):
+    # ──────────────────────────────────────────────────────────
+    # 복구: 크롬을 다시 띄우지 않고, 같은 브라우저 안에서 프레임만 다시 잡는다
+    # ──────────────────────────────────────────────────────────
+    def reenter_search_frame(self) -> bool:
+        """최상위 프레임으로 나갔다가 searchIframe 으로 다시 들어간다."""
         try:
-            parent = psutil.Process(parent_pid)
-            for child in parent.children(recursive=True):
-                try:
-                    if 'chrome' in child.name().lower():
-                        child.kill()
-                except Exception:
-                    pass
+            self.driver.switch_to.default_content()
         except Exception as e:
-            print(f"[경고] Chrome 자식 프로세스 종료 중 오류 발생: {e}")
+            if is_session_dead_error(e):
+                raise BrowserSessionDead(str(e)) from e
+            self.log(f"[WARN] default_content 복귀 실패: {e}")
+        return self.switch_to_frame("searchIframe")
 
-    def relaunch_browser_and_search_keyword(self, keyword: str) -> WebDriver | None:
+    def ensure_on_page(self, page_number: int, titles: list) -> bool:
+        """
+        프레임 재진입 후 리스트가 처음 페이지로 되돌아가 있으면(iframe 자체가 새로 로드된 경우)
+        원래 보던 페이지 번호로 다시 이동한다. 같은 페이지면 아무것도 하지 않는다.
+        """
+        if page_number <= 1 or not titles:
+            return True
         try:
-            # 기존 드라이버 종료 및 자식 프로세스 강제 종료
-            if self.driver:
-                try:
-                    chrome_pid = self.driver.service.process.pid
-                    self.driver.quit()
-                    self.log(f"[INFO] 기존 드라이버 quit 완료 (PID: {chrome_pid})")
-
-                    # ChromeDriver가 생성한 chrome 프로세스 강제 종료
-                    self.kill_driver_children(chrome_pid)
-                    self.log(f"[INFO] Chrome 자식 프로세스 종료 완료")
-
-                except Exception as e:
-                    self.log(f"[경고] 기존 드라이버 종료 중 오류 무시: {e}")
-        except Exception:
-            pass
-
-        try:
-            self.driver = self.utils.create_chrome_driver()
-            self.wait = WebDriverWait(self.driver, self.web_driver_wait_sec)
-
-            url = self.config.get("main_url")
-            self.driver.get(url)
-            self.utils.sleep_random("메인 페이지 로딩 대기", self.sleep_long_sec)
-
-            search = SearchKeyword(self.driver, self.config, log=self.log)
-            self.log(f"[복구] 키워드 재입력: {keyword}")
-            search.enter_keyword(keyword)
-            self.utils.sleep_random("검색 결과 로딩 대기", self.sleep_normal_sec)
-
-            return self.driver  # ✅ 새로 생성된 driver 반환
-        except Exception as e:
-            self.log(f"[ERROR] 브라우저 재시작 중 예외 발생: {e}")
-            return None
-
-    # 복구 함수 정의
-    def recover_after_timeout(self, page_number: int, keyword: str) -> bool:
-        self.log("[복구] Chrome 드라이버 종료 및 재시작 중...")
-        try:
-            new_driver = self.relaunch_browser_and_search_keyword(keyword)
-            if not new_driver:
-                return False
-
-            self.driver = new_driver  # ✅ driver 교체
-            self.wait = WebDriverWait(self.driver, self.web_driver_wait_sec)
-
-            # ✅ iframe 진입
-            if not self.switch_to_frame("searchIframe"):
-                return False
-
-            # ✅ 페이지 이동
-            if self.go_to_page(page_number):
-                self.utils.sleep_random(f"{page_number}p 페이지 복귀 완료", self.sleep_short_sec)
+            first_li = self.driver.find_elements(By.XPATH, '//*[@id="app-root"]//ul[1]/li')
+            if not first_li:
+                return self.go_to_page(page_number)
+            first_title = self.get_item_title(first_li[0])
+            if first_title == titles[0]:
                 return True
-            else:
-                self.log("[복구 실패] go_to_page 실패")
-                return False
-
+            self.log(f"[복구] 리스트가 다른 페이지를 보여주고 있어 {page_number}p 로 다시 이동합니다.")
+            return self.go_to_page(page_number)
         except Exception as e:
-            self.log(f"[복구 실패] 전체 복구 루틴 중 예외 발생: {e}")
+            if is_session_dead_error(e):
+                raise BrowserSessionDead(str(e)) from e
+            self.log(f"[WARN] 현재 페이지 확인 실패, {page_number}p 로 이동 시도: {e}")
+            return self.go_to_page(page_number)
+
+    def recover_frame(self, page_number: int, titles: list, reason: str) -> bool:
+        """프레임/요소 참조가 깨졌을 때의 복구 루틴. 브라우저는 그대로 둔다."""
+        self.log(f"[복구] 프레임 재진입 시도 (원인: {reason})")
+        if not self.reenter_search_frame():
             return False
+        return self.ensure_on_page(page_number, titles)
 
+    def raise_if_session_dead(self, e: Exception):
+        if is_session_dead_error(e):
+            raise BrowserSessionDead(str(e)) from e
 
-    def click_all_list_items_across_pages(self, keyword):
+    @staticmethod
+    def _short(e: Exception) -> str:
+        return f"{type(e).__name__}: {str(e).splitlines()[0] if str(e) else ''}"
+
+    # ──────────────────────────────────────────────────────────
+    # 탭 교체: 쌓인 메모리를 비우거나(Out of Memory 예방) 죽은 탭을 버리고 이어가기
+    # ──────────────────────────────────────────────────────────
+    def reset_page(self, page_number: int, reason: str) -> bool:
+        """
+        새 탭을 열어 처음부터 다시 검색하고 page_number 페이지로 이동한다. 크롬은 그대로 둔다.
+        네이버 지도는 항목을 클릭할수록 탭 메모리가 쌓여 수백 개쯤에서 탭이 죽으므로
+        페이지가 바뀔 때마다 호출해 메모리를 비운다. 탭이 이미 죽었을 때의 복구에도 쓴다.
+        """
+        self.log(f"[탭 교체] {reason} → 새 탭에서 '{self.keyword}' 재검색 후 {page_number}p 로 이동")
+        if not self.utils.open_fresh_tab(self.driver, self.config.get("main_url")):
+            return False
+        try:
+            SearchKeyword(self.driver, self.config, log=self.log).enter_keyword(self.keyword)
+        except Exception as e:
+            self.raise_if_session_dead(e)
+            self.log(f"[ERROR] 재검색 실패: {self._short(e)}")
+            return False
+        self.utils.sleep_random("검색 결과 로딩 대기", self.sleep_normal_sec)
+        if not self.reenter_search_frame():
+            return False
+        return self.go_to_page(page_number)
+
+    def click_all_list_items_across_pages(self, keyword) -> bool:
+        """
+        검색 결과 리스트의 모든 항목을 페이지를 넘겨 가며 클릭하고 정보를 수집한다.
+        :return: True(끝까지 처리), False(브라우저 세션이 끊겨 중단)
+        """
+        self.keyword = keyword
         page_number = 1
+        index = 0            # 현재 페이지에서 처리할 항목 위치 (탭 교체 후에도 이어서 진행)
+        titles = []
+        tab_recover_tries = 0
+        last_reset_index = 0  # 이 페이지에서 마지막으로 탭을 갈아탄 항목 위치
+        collected_names = set()  # 이 키워드에서 이미 수집한 가게명 (리스트에 광고/추가 항목이 끼어들어 밀려도 중복 수집 방지)
 
-        # 1. iframe(서치아이프레임) 으로 진입
-        if not self.switch_to_frame("searchIframe"):
-            return False
+        try:
+            # 1. iframe(서치아이프레임) 으로 진입
+            if not self.reenter_search_frame():
+                return True  # 검색 결과 프레임이 없으면 이 키워드는 건너뜀
 
-        ## ~~ test (특정 아이템 확인) ~~ ing
-        ## self.go_to_page(2)
+            while True:
+                try:
+                    self.log(f"[페이지 {page_number}] 리스트 항목 처리 시작" + (f" ({index + 1}번째부터)" if index else ""))
 
-        while True:
-            try:
+                    # 스크롤 타겟: _pcmap_list_scroll_container
+                    if not self.scroll_through_list_container():
+                        self.log("[오류] 스크롤 중 오류 발생 ")
 
-                self.log(f"[페이지 {page_number}] 리스트 항목 처리 시작")
+                    # 3. li 목록 가져오기 (페이지마다 동적으로 다시 로드해야 함)
+                    li_elements = self.wait.until(
+                        EC.presence_of_all_elements_located((By.XPATH, '//*[@id="app-root"]//ul[1]/li'))
+                    )
 
-                # 스크롤 타겟: _pcmap_list_scroll_container
-                if not self.scroll_through_list_container():
-                    self.log("[오류] 스크롤 중 오류 발생 ")
+                    titles = [self.get_item_title(li) for li in li_elements]
+                    self.log(f"[INFO]{page_number}p {len(titles)}개의 항목 발견됨.")
+                    # 처음 5개 항목만 로그로 출력 (PySide6에서 긴 문자열 출력이 문제를 일으킴)
+                    preview_count = 5
+                    preview_titles = titles[:preview_count]
+                    self.log(f" └▶ 대표 {preview_count}개: {'|'.join(preview_titles)}")
 
-                # 3. li 목록 가져오기 (페이지마다 동적으로 다시 로드해야 함)
-                li_elements = self.wait.until(
-                    EC.presence_of_all_elements_located((By.XPATH, '//*[@id="app-root"]//ul[1]/li'))
-                )
+                    recover_tries = 0
+                    reset_pending = False
 
-                titles = [
-                    li.find_element(By.CSS_SELECTOR, '.place_bluelink span:first-child').text.strip()
-                    for li in li_elements
-                ]
-                self.log(f"[INFO]{page_number}p {len(titles)}개의 항목 발견됨.")
-                # 처음 5개 항목만 로그로 출력 (PySide6에서 긴 문자열 출력이 문제를 일으킴)
-                preview_count = 5
-                preview_titles = titles[:preview_count]
-                self.log(f" └▶ 대표 {preview_count}개: {'|'.join(preview_titles)}")
+                    while index < len(li_elements):
+                        # ✅ 페이지 중간에도 일정 개수마다 새 탭으로 갈아타 메모리를 비운다
+                        if index - last_reset_index >= self.tab_reset_every_items:
+                            self.log(f"[MEM] {page_number}p {index}개 처리, 탭 메모리: {self.utils.get_memory_metrics(self.driver)}")
+                            last_reset_index = index
+                            if not self.reset_page(page_number, f"{page_number}p {index}개 처리, 메모리 비우기"):
+                                raise BrowserTabDead("새 탭 전환 실패")
+                            reset_pending = True
+                            break  # 바깥 루프에서 리스트를 다시 읽고 같은 index 부터 이어감
 
-                index = 0
+                        # ✅ 리스트 매 10개마다 메모리 정리
+                        if index % 10 == 0:
+                            self.log(f"[GC] {index}번째 항목 처리 중, 메모리 정리 수행")
+                            gc.collect()
 
-                ## ~~ test (특정 아이템 확인) ~~ ing
-                # try:
-                #     index_of_sojeom = titles.index("소점")
-                #     index = index_of_sojeom
-                #     self.log(f"'소점'의 index: {index_of_sojeom}")
-                # except ValueError:
-                #     self.log("'소점'이 리스트에 없습니다.")
+                        try:
+                            # 다시 가져와야 stale element 방지됨
+                            li_elements = self.driver.find_elements(By.XPATH, '//*[@id="app-root"]//ul[1]/li')
+                            target_li = li_elements[index]
 
-                while index < len(li_elements):
-                    # ✅ ~~ test (페이지 전환 테스트) ~~ ing 테스트용: 3번째(인덱스 3) 항목까지 처리한 뒤 중단
-                    # if index >= 3:
-                    #    self.log("[TEST] index == 3 도달 → 페이지 처리 테스트 종료")
-                    #    break
-
-                    # ~~ test (크롬 드라이버 재실행 테스트) ~~ ing
-                    # if (page_number == 4 and index == 0 and not self.recover_test_done) :
-                    #     self.recover_test_done = True  # ✅ 한 번만 실행되도록 플래그 설정
-                    #     if self.recover_after_timeout(page_number, keyword):
-                    #         index = max(index - 1, 0)  # 🔁 이전 항목부터 다시 시작
-                    #         continue
-                    #     else:
-                    #         self.log("[중단] 복구 실패로 페이지 루프 종료")
-                    #         break
-
-
-                    # ✅ 리스트 매 10개마다 메모리 정리
-                    if index % 10 == 0:
-                        self.log(f"[GC] {index}번째 항목 처리 중, 메모리 정리 수행")
-                        gc.collect()
-
-                    try:
-                        # 다시 가져와야 stale element 방지됨
-                        li_elements = self.driver.find_elements(By.XPATH, '//*[@id="app-root"]//ul[1]/li')
-                        target_li = li_elements[index]
-
-                        # 내부의 a 태그 (장소명 링크) 클릭
-                        link_elem = target_li.find_element(By.XPATH, './/a[contains(@class, "place_bluelink")]')
-                        self.driver.execute_script("arguments[0].scrollIntoView(true);", link_elem)
-                        link_elem.click()
-
-                        item = titles[index] if index < len(titles) else "Unknown"
-                        self.utils.sleep_random(f"[클릭] {page_number}p {index + 1}번째 항목({item}) 클릭 완료", self.sleep_short_sec)
-
-                        # 상세 정보 가져오기
-                        info = self.handle_entry_iframe_and_extract_info()
-                        self.log(f"[INFO] : {info}")
-
-                        # 엑셀에 저장
-                        append_info_row_to_excel(
-                            search_keyword=keyword,
-                            page=page_number,
-                            index=index,
-                            info=info,
-                            output_path=self.excel_output_path  # → "result_map_20250612152200.xlsx" 형식 등
-                        )
-
-                        index += 1  # 성공 시 다음으로 진행
-                        #self.utils.sleep_random("상세 정보 가져오기", self.sleep_short_sec)
-
-                    except Exception as e:
-                        self.log(f"[에러] {page_number}p {index + 1}번째 항목 클릭 중:", e)
-
-                        # ⚠️ 복구 가능한 예외 메시지이면 복구 시도
-                        if self.is_recoverable_error(e):
-                            self.log("[알림] 복구가 필요한 예외 발생 → 복구 루틴 진입")
-
-                            if self.recover_after_timeout(page_number, keyword):
-                                index = max(index - 1, 0)  # 🔁 이전 항목부터 다시 시작
+                            # 내부의 a 태그 (장소명 링크) 클릭
+                            link_elem = self.find_title_link(target_li)
+                            if link_elem is None:
+                                self.log(f"[SKIP] {page_number}p {index + 1}번째 항목에 가게명 링크가 없어 건너뜀")
+                                index += 1
                                 continue
-                            else:
-                                self.log("[중단] 복구 실패로 페이지 루프 종료")
-                                break
-                        else:
-                            index += 1  # 그 외 에러는 다음으로 넘어감
 
-                # 다음 페이지 이동 처리
-                next_page_result = self.go_to_next_page()
-                if next_page_result == 1:
+                            # 가게명은 클릭 시점의 리스트에서 다시 읽는다 (처리 중 리스트가 늘어나거나 밀릴 수 있음)
+                            item = self.get_item_title(target_li) or (titles[index] if index < len(titles) else "Unknown")
+                            if item in collected_names:
+                                self.log(f"[SKIP] {page_number}p {index + 1}번째 항목({item})은 이미 수집됨")
+                                index += 1
+                                continue
+
+                            self.driver.execute_script("arguments[0].scrollIntoView(true);", link_elem)
+                            link_elem.click()
+                            self.utils.sleep_random(f"[클릭] {page_number}p {index + 1}번째 항목({item}) 클릭 완료", self.sleep_short_sec)
+
+                            # 상세 정보 가져오기
+                            info = self.handle_entry_iframe_and_extract_info()
+                            if not info.get('name'):
+                                info['name'] = item  # 상세 프레임에서 못 찾으면 리스트의 가게명 사용
+                            self.log(f"[INFO] : {info}")
+
+                            # 상세 화면의 가게명으로 한 번 더 중복 확인 (리스트 가게명이 비었거나 다르게 표기된 경우 대비)
+                            if info['name'] in collected_names:
+                                self.log(f"[SKIP] {page_number}p {index + 1}번째 항목({info['name']})은 이미 수집됨 (상세 확인)")
+                                index += 1
+                                continue
+
+                            # 엑셀에 저장
+                            append_info_row_to_excel(
+                                search_keyword=keyword,
+                                page=page_number,
+                                index=index,
+                                info=info,
+                                output_path=self.excel_output_path  # → "result_map_20250612152200.xlsx" 형식 등
+                            )
+
+                            collected_names.add(info['name'])
+                            if item:
+                                collected_names.add(item)
+                            index += 1  # 성공 시 다음으로 진행
+                            recover_tries = 0
+                            tab_recover_tries = 0
+
+                        except (BrowserSessionDead, BrowserTabDead):
+                            raise
+                        except Exception as e:
+                            self.raise_if_session_dead(e)
+                            if is_renderer_dead_error(e):
+                                raise BrowserTabDead(self._short(e)) from e
+
+                            self.log(f"[에러] {page_number}p {index + 1}번째 항목 클릭 중:", e)
+
+                            if is_frame_lost_error(e):
+                                # ⚠️ 프레임/요소 참조가 깨진 경우 → 프레임만 다시 잡고 같은 항목 재시도.
+                                #    그래도 안 되면 탭을 통째로 갈아끼운다 (바깥 루프).
+                                recover_tries += 1
+                                if recover_tries > self.MAX_FRAME_RECOVER_TRIES:
+                                    raise BrowserTabDead("프레임 복구 반복 실패") from e
+                                self.log(f"[알림] 프레임 복구 {recover_tries}/{self.MAX_FRAME_RECOVER_TRIES}")
+                                if self.recover_frame(page_number, titles, self._short(e)):
+                                    continue  # 🔁 같은 index 부터 다시
+                                raise BrowserTabDead("프레임 복구 실패") from e
+
+                            index += 1  # 그 외 에러는 다음 항목으로 넘어감
+                            recover_tries = 0
+
+                    if reset_pending:
+                        continue  # 페이지 중간 탭 교체 후 같은 페이지를 다시 읽는다
+
+                    # 페이지 처리 끝. 다음 페이지가 있으면 새 탭에서 이어간다 (메모리 비우기)
+                    if not self.has_next_page():
+                        self.log("[종료] 더 이상 다음 페이지가 없습니다.")
+                        return True
+
+                    self.log(f"[MEM] {page_number}p 완료, 탭 메모리: {self.utils.get_memory_metrics(self.driver)}")
                     page_number += 1
-                    self.utils.sleep_random("다음 페이지 이동 처리")
-                elif next_page_result == -1:
-                    self.log("[알림] 복구가 필요한 예외 발생 → 복구 루틴 진입")
+                    index = 0
+                    last_reset_index = 0
+                    tab_recover_tries = 0
+                    if not self.reset_page(page_number, f"{page_number - 1}p 완료, 메모리 비우기"):
+                        raise BrowserTabDead("새 탭 전환 실패")
 
-                    if self.recover_after_timeout(page_number, keyword):
-                        index = max(index - 1, 0)  # 🔁 이전 항목부터 다시 시작
-                        continue
-                    else:
-                        self.log("[중단] 복구 실패로 페이지 루프 종료")
-                        break
-                else:
-                    self.log("[종료] 더 이상 다음 페이지가 없습니다.")
-                    break
+                except BrowserSessionDead:
+                    raise
+                except BrowserTabDead as e:
+                    tab_recover_tries += 1
+                    self.log(f"[알림] 탭 응답 없음 ({e}) → 탭 복구 {tab_recover_tries}/{self.MAX_TAB_RECOVER_TRIES}")
+                    if tab_recover_tries > self.MAX_TAB_RECOVER_TRIES:
+                        self.log("[중단] 탭 복구 반복 실패로 이 키워드 처리를 종료합니다.")
+                        return True
+                    if self.reset_page(page_number, "탭 복구"):
+                        continue  # 같은 페이지, 같은 index 부터 이어서
+                    # reset 실패 시 다음 바퀴에서 다시 시도 (횟수 제한 있음)
+                    continue
 
-            except Exception as e:
-                self.log("[에러] 페이지 처리 중 중단:", e)
-                if self.is_recoverable_error(e):
-                    self.log("[알림] 복구가 필요한 예외 발생 → 복구 루틴 진입")
-                    if self.recover_after_timeout(page_number, keyword):
-                        index = max(index - 1, 0)  # 🔁 이전 항목부터 다시 시작
-                        continue
-                    else:
-                        self.log("[중단] 복구 실패로 페이지 루프 종료")
-                        break
-                else:
-                    break  # 그 외 일반 예외는 중단
+        except BrowserSessionDead as e:
+            self.log(f"[FATAL] 브라우저 세션이 끊겨 '{keyword}' 처리를 중단합니다: {e}")
+            return False
+        except Exception as e:
+            self.log("[에러] 페이지 처리 중 중단:", e)
+            if is_session_dead_error(e):
+                return False
+            return True
 
-    def is_recoverable_error(self, e: Exception) -> bool:
-        """
-        브라우저 또는 iframe 세션 오류 등 복구 가능한 예외 메시지가 포함되어 있는지 확인
-        """
-        msg = str(e)
-        return any(keyword in msg for keyword in [
-            "Read timed out",
-            "target frame detached",  # ✅ iframe이 분리된 경우
-            "session not created",    # ✅ 세션 생성 실패
-            "invalid session id"      # ✅ 세션이 유효하지 않음
-        ])
+    # ──────────────────────────────────────────────────────────
+    # 페이지네이션
+    # ──────────────────────────────────────────────────────────
+    def get_page_buttons(self) -> dict:
+        """보이는 페이지 번호 버튼 {번호: 요소}"""
+        buttons = {}
+        for a in self.driver.find_elements(By.XPATH, '//a[@role="button" and string-length(normalize-space(text())) > 0]'):
+            text = a.text.strip()
+            if text.isdigit():
+                buttons[int(text)] = a
+        return buttons
 
-    def go_to_next_page(self):
+    def get_current_page_number(self, buttons: dict):
         """
-        '다음페이지' 버튼을 찾아 클릭하고 성공 여부 반환
-        :return: 1(성공적으로 이동), 0(버튼 없음 또는 비활성화), -1(복구 가능한 예외 메시지)
+        현재 페이지 번호. 현재 페이지 버튼에만 붙는 추가 클래스(난독화라 이름은 모름)를
+        '다른 버튼에는 없는 클래스 토큰' 으로 찾아낸다. 판별 불가면 None.
         """
+        if not buttons:
+            return None
+        if len(buttons) == 1:
+            return next(iter(buttons))
+        classes = {n: set((a.get_attribute("class") or "").split()) for n, a in buttons.items()}
+        common = set.intersection(*classes.values())
+        for n, cls in classes.items():
+            if cls - common:
+                return n
+        return None
+
+    def has_next_page(self) -> bool:
         try:
             next_btn = self.driver.find_element(By.XPATH, '(//a[./span[text()="다음페이지"]])[last()]')
-            if next_btn.get_attribute("aria-disabled") == "true":
-                return 0
-            next_btn.click()
-            return 1
+            return next_btn.get_attribute("aria-disabled") != "true"
         except Exception as e:
-            self.log("[WARN] 다음 페이지 버튼 클릭 실패:", e)
-            if self.is_recoverable_error(e):
-                return -1
-            return 0
+            self.raise_if_session_dead(e)
+            if is_renderer_dead_error(e):
+                raise BrowserTabDead(self._short(e)) from e
+            self.log(f"[WARN] 다음페이지 버튼 확인 실패(없는 것으로 간주): {self._short(e)}")
+            return False
 
     def go_to_page(self, page_number: int) -> bool:
         """
-        특정 페이지 번호 버튼을 클릭하고 성공 여부를 반환
-        :param page_number: 이동하려는 페이지 번호 (예: 2)
-        :return: True(성공적으로 이동), False(버튼 없음 또는 클릭 실패)
+        page_number 페이지로 이동한다. 번호 버튼이 보이면 바로 클릭하고,
+        보이지 않으면 '다음페이지'/'이전페이지' 로 번호 창을 옮겨 가며 찾는다.
+        :return: True(이동 완료), False(그런 페이지가 없거나 이동 실패)
         """
         try:
-            # 페이지 번호가 버튼에 텍스트로 표시되어 있으므로 텍스트 매칭
-            page_btn = self.driver.find_element(
-                By.XPATH,
-                f'//a[@role="button" and normalize-space(text())="{page_number}"]'
-            )
-            page_btn.click()
+            for _ in range(30):
+                buttons = self.get_page_buttons()
+                if not buttons:
+                    # 페이지네이션 자체가 없으면 결과가 한 페이지뿐
+                    return page_number == 1
+                current = self.get_current_page_number(buttons)
+                if current == page_number:
+                    break
+                if page_number in buttons:
+                    buttons[page_number].click()
+                    self.utils.sleep_random(f"{page_number}p 버튼 클릭", self.sleep_short_sec)
+                    if self.get_current_page_number(self.get_page_buttons()) in (page_number, None):
+                        break
+                    continue
+                # 번호가 보이는 범위 밖 → 다음/이전 페이지 버튼으로 범위를 옮긴다
+                label = "다음페이지" if page_number > max(buttons) else "이전페이지"
+                nav_btn = self.driver.find_element(By.XPATH, f'(//a[./span[text()="{label}"]])[last()]')
+                if nav_btn.get_attribute("aria-disabled") == "true":
+                    self.log(f"[WARN] {page_number}p 는 존재하지 않습니다 (마지막 페이지: {max(buttons)})")
+                    return False
+                nav_btn.click()
+                self.utils.sleep_random(f"{label} 클릭", self.sleep_short_sec)
+            else:
+                self.log(f"[WARN] {page_number}p 로 이동하지 못했습니다.")
+                return False
+
             self.utils.sleep_random(f"{page_number}p 페이지 이동")
             self.scroll_through_list_container()
-
             return True
         except Exception as e:
-            self.log(f"[WARN] 페이지 {page_number} 버튼 클릭 실패:", e)
+            self.raise_if_session_dead(e)
+            if is_renderer_dead_error(e):
+                raise BrowserTabDead(self._short(e)) from e
+            self.log(f"[WARN] 페이지 {page_number} 이동 실패:", e)
             return False
 
     def scroll_through_list_container(self):
@@ -342,6 +443,7 @@ class ResultsPagedListScraper:
             return False
 
     def handle_entry_iframe_and_extract_info(self):
+        tab_dead = False
         try:
             # 1. 메인 프레임으로 복귀
             self.driver.switch_to.default_content()
@@ -349,7 +451,7 @@ class ResultsPagedListScraper:
 
             # 2. 엔트리아이프레임 으로 진입
             if not self.switch_to_frame("entryIframe"):
-                return False
+                return dict(EMPTY_INFO)
 
 
             # iframe 안에서 렌더링된 내용의 구조를 디버깅하거나 특정 DOM 탐지 오류를 추적
@@ -360,25 +462,37 @@ class ResultsPagedListScraper:
             info = self.extract_info_from_place_section()
             # self.log(f"[INFO] 추출된 정보: {info}")
 
+        except (BrowserSessionDead, BrowserTabDead):
+            tab_dead = True
+            raise
         except Exception as e:
             self.log(f"[ERROR] (상세) 엔트리아이프레임 진입 또는 정보 추출 실패: {e}")
-            info = {'address': None, 'lot_number': None, 'phone': None, 'homepage': None, 'share': None, 'intro': None, 'main_keyword': []}
+            if is_session_dead_error(e):
+                raise BrowserSessionDead(str(e)) from e
+            if is_renderer_dead_error(e):
+                tab_dead = True
+                raise BrowserTabDead(str(e).splitlines()[0]) from e
+            info = dict(EMPTY_INFO)
 
         finally:
-            # 4. 메인 프레임 복귀
-            try:
-                self.driver.switch_to.default_content()
-                #self.utils.sleep_random("리스트로 이동 중", self.sleep_short_sec)
-            except Exception as e:
-                self.log(f"[ERROR] 메인 프레임 복귀 실패: {e}")
+            # 탭이 죽었으면 프레임 복귀 명령도 전부 타임아웃만 나므로 건너뛴다 (바깥에서 새 탭으로 복구)
+            if not tab_dead:
+                # 4. 메인 프레임 복귀
+                try:
+                    self.driver.switch_to.default_content()
+                    #self.utils.sleep_random("리스트로 이동 중", self.sleep_short_sec)
+                except Exception as e:
+                    self.log(f"[ERROR] 메인 프레임 복귀 실패: {e}")
 
-            # 5. 다시 서치아이프레임 으로 진입
-            try:
-                if not self.switch_to_frame("searchIframe"):
-                    return False
-                #self.log("[INFO] (리스트) 서치아이프레임 복귀 완료")
-            except Exception as e:
-                self.log(f"[ERROR] (리스트) 서치아이프레임 복귀 실패: {e}")
+                # 5. 다시 서치아이프레임 으로 진입
+                try:
+                    if not self.switch_to_frame("searchIframe"):
+                        self.log("[ERROR] (리스트) 서치아이프레임 복귀 실패")
+                    #self.log("[INFO] (리스트) 서치아이프레임 복귀 완료")
+                except (BrowserSessionDead, BrowserTabDead):
+                    raise
+                except Exception as e:
+                    self.log(f"[ERROR] (리스트) 서치아이프레임 복귀 실패: {e}")
 
         return info
 
@@ -395,13 +509,25 @@ class ResultsPagedListScraper:
                     EC.presence_of_all_elements_located((By.CLASS_NAME, "place_section"))
                 )
                 if place_sections:
-                    try:
-                        # name은 첫 번째 place_section > div > div#_title > div > span[0]
-                        name_elem = place_sections[0].find_element(By.XPATH, './/div[@id="_title"]//div/span[1]')
-                        info['name'] = name_elem.text.strip()
-                    except Exception as e:
-                        self.log(f"[WARN] 이름 추출 실패: {e}")
-                        info['name'] = None
+                    info['name'] = None
+                    # 예전 DOM: place_section > div#_title > div > span[1]
+                    # 현재 DOM: place_section > div > span (예: <div class="WmLT9"><span class="PbnXW">가게명</span></div>)
+                    #   단, 가게명 div 앞에 "플레이스 플러스" 배지 div 가 끼어드는 경우가 있다.
+                    #   배지는 svg + 숨김 텍스트(span.place_blind)로만 되어 있으므로
+                    #   "직접 텍스트를 가진 span 중 place_blind 가 아닌 첫 번째" 를 가게명으로 본다.
+                    for name_xpath in (
+                        './/div[@id="_title"]//div/span[1]',
+                        '(./div//span[normalize-space(text()) and not(contains(@class, "place_blind"))])[1]',
+                    ):
+                        name_elems = place_sections[0].find_elements(By.XPATH, name_xpath)
+                        if not name_elems:
+                            continue
+                        name = name_elems[0].text.strip()
+                        if name and name not in self.NAME_BADGE_TEXTS:
+                            info['name'] = name
+                            break
+                    if not info['name']:
+                        self.log("[WARN] 상세 프레임에서 이름을 찾지 못함 (리스트의 가게명으로 대체)")
                 else:
                     self.log("[WARN] 'place_section' 요소 없음")
                     info['name'] = None
@@ -609,8 +735,24 @@ class ResultsPagedListScraper:
                         self.log(f"[WARN] 공유 닫기 버튼 클릭 실패: {e}")
 
                 except Exception as e:
-                    self.log(f"[WARN] 공유 추출 실패: {e}")
+                    # 현재 DOM 에는 예전 공유 레이어(spi_copyurl)가 없다.
+                    # 상세 프레임 링크(/place/{id}/...)에서 place id 를 뽑아 장소 URL 을 만든다.
                     info['share'] = None
+                    try:
+                        # 링크 형식은 업종별로 /place/ID, /restaurant/ID, /cafe/ID ... 로 다르지만
+                        # 장소 URL 은 공통으로 /p/entry/place/ID 를 쓸 수 있다.
+                        place_links = self.driver.find_elements(
+                            By.XPATH, '//a[contains(@href, "/photo") or contains(@href, "/review") or contains(@href, "/home")]'
+                        )
+                        for a in place_links[:5]:
+                            m = re.search(r"/[a-z]+/(\d{6,})(?:[/?#]|$)", a.get_attribute("href") or "")
+                            if m:
+                                info['share'] = f"https://map.naver.com/p/entry/place/{m.group(1)}"
+                                break
+                    except Exception:
+                        pass
+                    if not info['share']:
+                        self.log(f"[WARN] 공유 추출 실패: {e}")
 
                 # 지번 주소(lot_number) 추출
                 ## ~~ ing
@@ -627,7 +769,7 @@ class ResultsPagedListScraper:
                 self.utils.sleep_random("전체 섹션 재시도 대기", self.sleep_normal_sec)
         # 최종 실패
         self.log("[ERROR] 전체 섹션 로딩 최종 실패")
-        return {'address': None, 'lot_number': None, 'phone': None, 'homepage': None, 'share': None, 'intro': None, 'main_keyword': []}
+        return dict(EMPTY_INFO)
 
 
     def extract_detail_info_if_more_available(self, info_section, info):
